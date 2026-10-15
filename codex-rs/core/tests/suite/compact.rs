@@ -22,6 +22,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
@@ -429,7 +430,7 @@ fn assert_pre_sampling_switch_compaction_requests(
     next_model: &str,
 ) {
     assert_eq!(first["model"].as_str(), Some(previous_model));
-    assert_eq!(compact["model"].as_str(), Some(previous_model));
+    assert_eq!(compact["model"].as_str(), Some(next_model));
     assert_eq!(follow_up["model"].as_str(), Some(next_model));
 
     let compact_body = compact.to_string();
@@ -2394,6 +2395,126 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     assert!(follow_up_body.contains(remote_summary));
 }
 
+#[test_case::test_case("previous-provider/large-model", "selected-provider/small-model", None; "provider_downshift")]
+#[test_case::test_case("provider/sol", "provider/astra", Some(("sol-hash", "astra-hash")); "same_provider_comp_hash_change")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_sampling_compact_uses_selected_provider_after_model_switch(
+    previous_model: &str,
+    next_model: &str,
+    comp_hashes: Option<(&str, &str)>,
+) {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let mut previous_info =
+        model_info_with_context_window(previous_model, /*context_window*/ 273_000);
+    previous_info
+        .supported_reasoning_levels
+        .retain(|level| level.effort != ReasoningEffort::XHigh);
+    previous_info.default_reasoning_level = Some(ReasoningEffort::High);
+    let mut next_info = model_info_with_context_window(next_model, /*context_window*/ 125_000);
+    if let Some((previous_hash, next_hash)) = comp_hashes {
+        previous_info.comp_hash = Some(previous_hash.to_string());
+        next_info.comp_hash = Some(next_hash.to_string());
+        next_info.context_window = previous_info.context_window;
+        next_info.max_context_window = previous_info.max_context_window;
+    }
+    mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![previous_info, next_info],
+        },
+    )
+    .await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("before", "before switch"),
+                ev_completed_with_tokens("first", /*total_tokens*/ 120_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("summary", "SWITCH_SUMMARY"),
+                ev_completed_with_tokens("compact", /*total_tokens*/ 10),
+            ]),
+            sse(vec![
+                ev_assistant_message("after", "after switch"),
+                ev_completed_with_tokens("last", /*total_tokens*/ 100),
+            ]),
+        ],
+    )
+    .await;
+    let provider = non_openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(previous_model)
+        .with_config(move |config| {
+            config.model_provider = provider;
+            set_test_compact_prompt(config);
+        });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build test codex");
+    let mut first_turn = disabled_permission_user_turn(
+        "before switch",
+        test.cwd.path().to_path_buf(),
+        previous_model.to_string(),
+    );
+    first_turn
+        .thread_settings
+        .collaboration_mode
+        .as_mut()
+        .expect("collaboration mode")
+        .settings
+        .reasoning_effort = Some(ReasoningEffort::High);
+    test.codex
+        .start_or_steer_turn(first_turn)
+        .await
+        .expect("submit first turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let mut next_turn = disabled_permission_user_turn(
+        "continue after switch",
+        test.cwd.path().to_path_buf(),
+        next_model.to_string(),
+    );
+    next_turn
+        .thread_settings
+        .collaboration_mode
+        .as_mut()
+        .expect("collaboration mode")
+        .settings
+        .reasoning_effort = Some(ReasoningEffort::XHigh);
+    test.codex
+        .start_or_steer_turn(next_turn)
+        .await
+        .expect("submit switched turn");
+    assert_compaction_uses_turn_lifecycle_id(&test.codex).await;
+    let requests = request_log.requests();
+    let models: Vec<_> = requests
+        .iter()
+        .map(|request| request.body_json()["model"].clone())
+        .collect();
+    assert_eq!(
+        models,
+        vec![json!(previous_model), json!(next_model), json!(next_model)]
+    );
+    let efforts: Vec<_> = requests
+        .iter()
+        .map(|request| request.body_json()["reasoning"]["effort"].clone())
+        .collect();
+    assert_eq!(efforts, vec![json!("high"), json!("xhigh"), json!("xhigh")]);
+    let compact = requests[1].body_json().to_string();
+    assert!(compact.contains("before switch"));
+    assert!(!compact.contains("continue after switch"));
+    let follow_up = requests[2].body_json().to_string();
+    assert!(follow_up.contains("SWITCH_SUMMARY"));
+    assert!(follow_up.contains("continue after switch"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     skip_if_no_network!();
@@ -2585,7 +2706,7 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn previous_model_compaction_resolves_selected_settings() -> Result<()> {
+async fn local_model_switch_compaction_resolves_selected_settings() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let request_log = mount_sse_sequence(
@@ -2650,8 +2771,7 @@ async fn previous_model_compaction_resolves_selected_settings() -> Result<()> {
     })
     .await;
 
-    // The retained priority selection is filtered out for B, restored for
-    // compaction on A, and still omitted from the following B request.
+    // Compaction and following sampling both use B's summary and service-tier support.
     let actual = request_log
         .requests()
         .iter()
@@ -2668,7 +2788,7 @@ async fn previous_model_compaction_resolves_selected_settings() -> Result<()> {
         actual,
         vec![
             json!(["gpt-5.4", "detailed", "priority"]),
-            json!(["gpt-5.4", "detailed", "priority"]),
+            json!(["gpt-5.2", "auto", null]),
             json!(["gpt-5.2", "auto", null]),
         ]
     );
@@ -3374,7 +3494,7 @@ async fn manual_remote_compact_advice_respects_retry_limit(max_retries: u64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider() {
+async fn pre_sampling_local_compact_uses_selected_model_for_api_key_auth_and_custom_provider() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;

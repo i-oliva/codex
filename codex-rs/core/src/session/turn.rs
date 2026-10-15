@@ -1409,8 +1409,9 @@ fn comp_hash_changed(previous: Option<&str>, current: Option<&str>) -> bool {
         .is_some_and(|(previous, current)| previous != current)
 }
 
-/// Runs pre-sampling compaction against the previous model when its compaction compatibility
-/// hash changed or when switching to a smaller context-window model.
+/// Runs pre-sampling compaction when the compaction compatibility hash changes or the
+/// selected model has a smaller context window. Local compaction uses the selected model;
+/// remote compaction can use the previous model to read its encrypted history.
 ///
 /// Returns `Err(_)` only when compaction was attempted and failed.
 async fn maybe_run_previous_model_inline_compact(
@@ -1476,14 +1477,31 @@ async fn maybe_run_previous_model_inline_compact(
         CompactionReason::ModelDownshift
     };
 
-    let step_context = sess
-        .capture_step_context(previous_model_turn_context, cancellation_token)
-        .await?;
-    // The previous model summarizes the old window; the current model owns its replacement.
-    // Reuse the replacement step if the compaction request needs to fall back to that model.
-    let replacement_step_context = sess
-        .capture_speculative_step_context(Arc::clone(turn_context), cancellation_token)
-        .await?;
+    let (step_context, replacement_step_context) = match previous_model_turn_context
+        .provider
+        .capabilities()
+        .remote_compaction
+    {
+        RemoteCompactionSupport::Unsupported => {
+            // Local history is plain text. Honor the new selection without requiring
+            // credentials or reasoning settings from the previous model.
+            let step_context = sess
+                .capture_step_context(Arc::clone(turn_context), cancellation_token)
+                .await?;
+            (Arc::clone(&step_context), step_context)
+        }
+        RemoteCompactionSupport::V2 => {
+            let step_context = sess
+                .capture_step_context(previous_model_turn_context, cancellation_token)
+                .await?;
+            // The previous model summarizes the old window; the current model owns its
+            // replacement and the fallback if remote compaction rejects the old model.
+            let replacement_step_context = sess
+                .capture_speculative_step_context(Arc::clone(turn_context), cancellation_token)
+                .await?;
+            (step_context, replacement_step_context)
+        }
+    };
     run_auto_compact(
         sess,
         step_context,
