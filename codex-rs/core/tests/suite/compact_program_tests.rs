@@ -1,4 +1,4 @@
-//! Model-switch compaction must retain the historical model/program pair across replay.
+//! Model-switch compaction must pair each model with its access program across replay.
 
 use super::*;
 use codex_core::CodexThread;
@@ -330,14 +330,19 @@ async fn model_switch_program_pair(
             json!([body["model"], body["access_programs"]])
         })
         .collect::<Vec<_>>();
-    // Check fallback and subsequent sampling even when the historical request is wrong.
+    // Fallback and subsequent sampling use the newly selected model/program pair.
     let mut following = Vec::new();
     if matches!(compaction, Compaction::Fallback) {
         following.push(json!([next_model, new_program]));
     }
     following.push(json!([next_model, new_program]));
     assert_eq!(&actual[1..], following.as_slice());
-    assert_eq!(actual[0], json!([previous_model, old_program]));
+    let expected_compaction = if local {
+        json!([next_model, new_program])
+    } else {
+        json!([previous_model, old_program])
+    };
+    assert_eq!(actual[0], expected_compaction);
     if !local {
         assert_eq!(requests[0].inputs_of_type("compaction_trigger").len(), 1);
     }
