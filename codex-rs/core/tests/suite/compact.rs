@@ -1159,19 +1159,21 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
     reported_usage: Value,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
-    for (provider, expected_error) in [
+    let previous_model = "gpt-5.4";
+    let selected_model = "gpt-5.2";
+    for (provider, expected_error, compaction_model) in [
         (
             non_openai_model_provider as fn(&MockServer) -> ModelProviderInfo,
             "Incomplete response returned, reason: max_output_tokens",
+            selected_model,
         ),
         (
             openai_model_provider,
             "Error running remote compact task: Incomplete response returned, reason: max_output_tokens",
+            previous_model,
         ),
     ] {
         let server = start_mock_server().await;
-        let previous_model = "gpt-5.4";
-        let selected_model = "gpt-5.2";
         let response_mock = mount_sse_sequence(
             &server,
             vec![
@@ -1214,8 +1216,8 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
             .build_with_auto_env(&server)
             .await?;
         test.submit_turn("hello").await?;
-        // A smaller selected model forces compaction with the previous model.
-        // An incomplete result must stop both retries and fallback to the selected model.
+        // A smaller selected model forces compaction. Incomplete output must stop
+        // both retries and remote fallback to the selected model.
         test.codex
             .start_or_steer_turn(
                 TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1268,7 +1270,7 @@ async fn incomplete_response_during_compaction_is_terminal_and_counted(
                 .iter()
                 .map(|request| request.body_json()["model"].clone())
                 .collect::<Vec<_>>(),
-            vec![json!(previous_model), json!(previous_model)],
+            vec![json!(previous_model), json!(compaction_model)],
         );
     }
     Ok(())
